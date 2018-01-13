@@ -9,6 +9,8 @@
 const Audit = require('./audit');
 const Util = require('../report/v2/renderer/util');
 const UnusedBytes = require('./byte-efficiency/byte-efficiency-audit');
+const THRESHOLD_IN_MS = 100;
+const PageDependencyGraphArtifact = require('../gather/computed/page-dependency-graph.js')
 
 class UsesRelPreloadAudit extends Audit {
   /**
@@ -21,7 +23,7 @@ class UsesRelPreloadAudit extends Audit {
       description: 'Preload key requests',
       helpText: 'Consider using <link rel=preload> to prioritize fetching late-discovered ' +
         'resources sooner [Learn more](https://developers.google.com/web/updates/2016/03/link-rel-preload).',
-      requiredArtifacts: ['devtoolsLogs'],
+      requiredArtifacts: ['devtoolsLogs', 'traces',],
       scoringMode: Audit.SCORING_MODES.NUMERIC,
     };
   }
@@ -53,6 +55,7 @@ class UsesRelPreloadAudit extends Audit {
    * @return {!AuditResult}
    */
   static audit(artifacts) {
+    const trace = artifacts.traces[Audit.DEFAULT_PASS];
     const devtoolsLogs = artifacts.devtoolsLogs[UsesRelPreloadAudit.DEFAULT_PASS];
 
     return Promise.all([
@@ -60,31 +63,39 @@ class UsesRelPreloadAudit extends Audit {
       artifacts.requestMainResource(devtoolsLogs),
     ]).then(([critChains, mainResource]) => {
       const results = [];
-      let totalWastedMs = 0;
-      // get all critical requests 2 levels deep
-      const criticalRequests = UsesRelPreloadAudit._flattenRequests(critChains, 2, 2);
+      let maxWasted = 0;
+      // get all critical requests 2 + mainResourceIndex levels deep
+      const mainResourceIndex = mainResource.redirects ? mainResource.redirects.length : 0;
+      const criticalRequests = UsesRelPreloadAudit._flattenRequests(critChains, 3 + mainResourceIndex, 2 + mainResourceIndex);
       criticalRequests.forEach(request => {
         const networkRecord = request;
         if (!networkRecord._isLinkPreload && networkRecord.protocol !== 'data') {
           // calculate time between mainresource.endTime and resource start time
           const wastedMs = (request._startTime - mainResource._endTime) * 1000;
-          totalWastedMs += wastedMs;
-          results.push({
-            url: request._url,
-            downloadTime: Util.formatMilliseconds(wastedMs),
-          });
+
+          if (wastedMs >= THRESHOLD_IN_MS) {
+            maxWasted = Math.max(wastedMs, maxWasted);
+            results.push({
+              url: request._url,
+              wastedMs: Util.formatMilliseconds(wastedMs),
+            });
+          }
         }
       });
+
+      // sort results by wastedTime DESC
+      results.sort((a, b) => b.wastedMs - a.wastedMs);
+
       const headings = [
         {key: 'url', itemType: 'url', text: 'URL'},
-        {key: 'downloadTime', itemType: 'url', text: 'Time to download'},
+        {key: 'wastedMs', itemType: 'text', text: 'Potential Savings'},
       ];
       const details = Audit.makeTableDetails(headings, results);
 
       return {
-        score: UnusedBytes.scoreForWastedMs(totalWastedMs),
-        rawValue: totalWastedMs,
-        displayValue: Util.formatMilliseconds(totalWastedMs),
+        score: UnusedBytes.scoreForWastedMs(maxWasted),
+        rawValue: maxWasted,
+        displayValue: Util.formatMilliseconds(maxWasted),
         extendedInfo: {
           value: results,
         },
